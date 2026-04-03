@@ -11,6 +11,57 @@ class Debugger:
         if not self.target or not self.target.IsValid():
             raise RuntimeError(f"Failed to create target for {executable}")
 
+    def lookup_symbol_location(self, name):
+        """
+        Resolve a perf symbol name to 'file:line' using LLDB.
+        Returns None if not found.
+        """
+
+        # 1. Try direct symbol lookup (best for perf)
+        symbols = self.target.FindSymbols(name)
+
+        if symbols.GetSize() == 0:
+            # fallback: try function lookup
+            symbols = self.target.FindFunctions(name)
+
+            if symbols.GetSize() == 0:
+                return None
+
+        sym_ctx = symbols.GetContextAtIndex(0)
+
+        # Prefer function, fallback to symbol
+        obj = sym_ctx.GetFunction() or sym_ctx.GetSymbol()
+        if not obj:
+            return None
+
+        addr = obj.GetStartAddress()
+        line_entry = addr.GetLineEntry()
+
+        if not line_entry.IsValid():
+            return None
+
+        file_spec = line_entry.GetFileSpec()
+        directory = file_spec.GetDirectory()
+        filename = file_spec.GetFilename()
+        line = line_entry.GetLine()
+
+        if filename is None:
+            return None
+
+        full_path = f"{directory}/{filename}" if directory else filename
+        return f"{full_path}:{line}"
+
+    def resolve_addr(self, ip):
+        #addr = self.target.ResolveLoadAddress(ip)
+        addr = self.target.modules[0].ResolveFileAddress(ip)
+        assert len(self.target.modules) == 1
+        #if random.randint(0, 10005) == 10000:
+        #    breakpoint()
+        #print(addr, addr.GetFunction())
+        #breakpoint()
+        print(addr)
+        return addr.GetFunction().name, 10
+
     def list_function(self, func_name, num_lines=50):
         # Find functions by name
         funcs = self.target.FindFunctions(func_name)
