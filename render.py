@@ -1,18 +1,191 @@
+import os
 import pickle
 import dearpygui.dearpygui as dpg
+from flamegraph import *
+from pathlib import Path
 
-# ---------------- Load data ---------------- #
 
-from perf_parser import PerfParser  # your class
+def remove_item(tag):
+    if dpg.does_item_exist(tag):
+        dpg.delete_item(tag)
 
-with open("callstacks.pickle", "rb") as f:
-    perf = pickle.load(f)
+class Application:
+    def __init__(self, flamegraphs_file="flamegraphs.pickle"):
+        with open(flamegraphs_file, "rb") as f:
+            self.fgs = pickle.load(f)
 
-#--- debugger ---
+        self.active_node = None
+        self.hovered_node = None
 
-from debugger import Debugger
-import os
-dbg = Debugger(os.environ.get("EXE", "/vol/os/linux/old-vmlinux-for-old-perf-data/vmlinux"))
+        from debugger import Debugger
+        self.dbg = Debugger(os.environ["SOURCE_EXE"])
+
+    def select_node(self, node):
+        old_active = self.active_node
+        if node is not None:
+            self.active_node = node
+        if node != old_active:
+            self.draw_flamegraph(self.active_node)
+            self.set_source(self.active_node)
+
+    def hover_node(self, node):
+        old_hover = self.hovered_node
+        if node is not None:
+            self.hovered_node = node
+        if node != old_hover:
+            self.set_source(self.hovered_node)
+
+    def set_source(self, node):
+        pathline = self.fgs.id_to_path.get(node.func_id)
+        print(pathline)
+        if pathline is None:
+            return
+
+        line_hist = self.dbg.byte_to_line_histogram(
+            node.counter,
+            self.fgs.idx_to_name[node.func_id][1]
+        )
+
+        total_samples = sum(node.counter.values())
+        if total_samples == 0:
+            total_samples = 1  # avoid division by zero
+
+
+        from pprint import pp
+        pp(self.dbg.byte_to_line_histogram(node.counter, self.fgs.idx_to_name[node.func_id][1]))
+
+        path, _, line_no = pathline.rpartition(':')
+        with open(path, 'r') as f:
+            full_lines = f.readlines()
+            header = full_lines[int(line_no)-3:int(line_no)]
+            lines = full_lines[int(line_no):int(line_no) + 200]
+
+        display_lines = []
+        for i, line in enumerate(lines, start=1):  # lines start at 1
+            count = line_hist.get(i, 0)
+            percent = int(count * 100 / total_samples)
+            if percent > 0:
+                display_line = f"{percent:>3}% {line}"
+            else:
+                display_line = f"    {line}"  # align lines with no samples
+            display_lines.append(display_line)
+
+        remove_item("source-container")
+        with dpg.child_window(width=-1, height=-1, border=False, tag="source-container", parent="source-window"):
+            dpg.add_text(str(Path(pathline).relative_to(base_dir)))
+            dpg.add_separator()
+            dpg.add_text(''.join(header))
+            dpg.add_text(''.join(display_lines))
+
+
+    def draw_flamegraph(self, root):
+        WIDTH = parent_width = dpg.get_item_width("flamegraph-window")
+        WINDOW_HEIGHT = parent_height = dpg.get_item_height("flamegraph-window")
+        RECT_HEIGHT=20
+        rects = []
+
+        # --- find ancestors ---
+        ancestors = []
+        current = root.parent
+        while current is not None:
+            ancestors.append(current)
+            current = current.parent
+        ancestors.reverse()
+
+        start_depth = len(ancestors)
+
+        layout(root, 0, WIDTH - 40, start_depth, rects)
+        ancestor_rects = [(node, 0, WIDTH - 40, i) for i, node in enumerate(ancestors)]
+        rects_to_render = ancestor_rects + rects
+
+        # --- draw child window ---
+        remove_item("flamegraph-container")
+
+        with dpg.child_window(width=-1, height=-1, border=False, tag="flamegraph-container", parent="flamegraph-window"):
+            # invert y so depth 0 is at bottom
+            max_depth = max(depth for _, _, _, depth in rects_to_render) if rects_to_render else 0
+            # compute total used height
+            total_height = (max_depth + 1) * RECT_HEIGHT
+            y_offset = max(0, WINDOW_HEIGHT - total_height)  # push down if smaller than window
+
+            for i, (node, x0, x1, depth) in enumerate(rects_to_render):
+                width = max(x1 - x0, 1)
+                y = (max_depth - depth) * RECT_HEIGHT + y_offset
+
+                label = self.fgs.func_label(node.func_id) if width > 60 else ""
+                if node.parent is None:
+                    label = "[all]"
+
+                tag = f"func_button_{i}"
+
+                # get path for coloring
+                path = self.fgs.id_to_path.get(node.func_id, "[unknown]")
+                rgb = pc.color(path)
+                color = [int(c*255) for c in rgb] + [255]
+
+                with dpg.theme() as color_theme:
+                    with dpg.theme_component(dpg.mvAll):
+                        dpg.add_theme_color(dpg.mvThemeCol_Button, tuple(color))
+                        dpg.add_theme_color(dpg.mvThemeCol_Text, (0,0,0,255))  # black text
+
+                remove_item(f"flamegraph_hover_handler_{i}")
+                def hover_callback(sender, app_data, user_data):
+                    self.hover_node(user_data)
+                with dpg.item_handler_registry(tag=f"flamegraph_hover_handler_{i}") as handler:
+                    dpg.add_item_hover_handler(callback=hover_callback, user_data=node)
+
+                dpg.add_button(
+                    label=label,
+                    pos=(x0, y),
+                    width=width,
+                    height=RECT_HEIGHT,
+                    callback=lambda s,a,u: u[0].select_node(u[1]),
+                    user_data=(self, node),
+                    tag=tag
+                )
+                dpg.bind_item_handler_registry(tag, f"flamegraph_hover_handler_{i}")
+                dpg.bind_item_theme(tag, color_theme)
+                dpg.set_y_scroll("flamegraph-container", max_depth * RECT_HEIGHT)
+
+        # auto-scroll to bottom
+        dpg.set_y_scroll("flamegraph-container", max_depth * RECT_HEIGHT)
+        #dpg.set_primary_window("flamegraph-window", True)
+
+    def run(self):
+        dpg.create_context()
+
+
+        with dpg.window(label="Flamegraph", tag="flamegraph-window", width=1400, height=1000):
+            totals = {k: self.fgs.roots[k].total() for k in self.fgs.roots}
+            grand_total = sum(totals.values()) or 1  # avoid div by zero
+
+            items = sorted(totals, key=totals.get, reverse=True)
+            labels = {
+                f"{k} ({totals[k] / grand_total:.1%})": k
+                for k in items
+            }
+
+            def on_select(sender, app_data):
+                key = labels[app_data]
+                self.select_node(self.fgs.roots[key])
+
+            dpg.add_combo(list(labels.keys()), callback=on_select, default_value=next(iter(labels.keys())))
+            pc.draw_legend()
+            dpg.add_button(label="Refresh", callback=lambda s, a, u: u.select_node(None), user_data=self)
+            on_select(None, next(iter(labels.keys())))
+
+        with dpg.window(label="Function snippet", tag="source-window", height=800, width=400):
+            pass
+
+
+        dpg.create_viewport(title="Flamegraph", width=1500, height=900)
+        dpg.setup_dearpygui()
+        dpg.show_viewport()
+
+        while dpg.is_dearpygui_running():
+            dpg.render_dearpygui_frame()
+
+        dpg.destroy_context()
 
 groups = {
     "net": ["net", "drivers/net"],
@@ -35,235 +208,5 @@ from color_flamegraph import PathColorizer
 # Initialize PathColorizer
 pc = PathColorizer(groups=groups, base_dir_root=base_dir, overrides=overrides)
 
-# ---------------- Reverse function map ---------------- #
 
-# (dso, func_name) -> id  ==>  id -> (dso, func_name)
-id_to_func = {v: k for k, v in perf.function_names.items()}
-
-# first, create a function id -> path lookup
-id_to_path = {}
-for (dso, func_name), fid in perf.function_names.items():
-    # lookup full location using Debugger
-    if func_name is None and dso is None:
-        path = "[unknown]"
-    elif func_name is None:
-        path = f"[{dso}]"
-    else:
-        # use your debugger to resolve location path
-        path = dbg.lookup_symbol_location(func_name) or f"[{dso}]"
-    id_to_path[fid] = path
-
-
-def func_label(func_id):
-    dso, name = id_to_func.get(func_id, (None, None))
-
-    if dso is None and name is None:
-        return "[unknown]"
-
-    if name is None:
-        return f"[{dso}]"
-
-    return name
-
-
-# ---------------- Flamegraph structures ---------------- #
-
-class FlameNode:
-    __slots__ = ("func_id", "counter", "children", "parent")
-
-    def __init__(self, func_id, parent=None):
-        self.func_id = func_id
-        self.counter = {}
-        self.children = {}
-        self.parent = parent
-
-    def add_sample(self, offset):
-        self.counter[offset] = self.counter.get(offset, 0) + 1
-
-    def get_or_create_child(self, func_id):
-        if func_id not in self.children:
-            self.children[func_id] = FlameNode(func_id, self)
-        return self.children[func_id]
-
-    def total(self):
-        return sum(self.counter.values())
-
-
-# ---------------- Builder ---------------- #
-
-def build_flamegraph(stacks):
-    root = FlameNode(None)
-
-    prev_stack = []
-    stack_nodes = [root]
-
-    for stack in stacks:
-        # LCP
-        lcp = 0
-        for a, b in zip(prev_stack, stack):
-            if a[0] != b[0]:
-                break
-            lcp += 1
-
-        stack_nodes = stack_nodes[:lcp + 1]
-
-        # extend
-        for i in range(lcp, len(stack)):
-            func_id, _ = stack[i]
-            parent = stack_nodes[-1]
-            node = parent.get_or_create_child(func_id)
-            stack_nodes.append(node)
-
-        # update counters
-        for node, (_, offset) in zip(stack_nodes[1:], stack):
-            node.add_sample(offset)
-
-        prev_stack = stack
-
-    return root
-
-
-# ---------------- Layout ---------------- #
-
-RECT_HEIGHT = 20
-WIDTH = 1400
-
-
-def layout(node, x0, x1, depth, rects):
-    total = node.total()
-    if total == 0:
-        return
-
-    rects.append((node, x0, x1, depth))
-
-    cur_x = x0
-    for child in node.children.values():
-        w = (child.total() / total) * (x1 - x0)
-        layout(child, cur_x, cur_x + w, depth + 1, rects)
-        cur_x += w
-
-
-# ---------------- Rendering ---------------- #
-
-def remove_item(tag):
-    if dpg.does_item_exist(tag):
-        dpg.delete_item(tag)
-
-RECT_HEIGHT = 20
-WIDTH = 1400
-WINDOW_HEIGHT = 800  # used for scrolling
-
-def draw_flamegraph(root):
-    print(f"drawing for item {root}")
-    rects = []
-
-    # --- find ancestors ---
-    ancestors = []
-    current = root
-    while current is not None:
-        ancestors.append(current)
-        current = current.parent
-    ancestors.reverse()  # root-most ancestor first
-
-    # starting depth is number of ancestors
-    start_depth = len(ancestors)
-
-    # --- layout subtree ---
-
-    if root.parent is None:
-        total = sum(c.total() for c in root.children.values())
-    else:
-        total = root.total()
-    cur_x = 0
-    for child in root.children.values():
-        w = (child.total() / total) * WIDTH if total > 0 else WIDTH
-        layout(child, cur_x, cur_x + w, start_depth, rects)  # start_depth passed here
-        cur_x += w
-
-    # --- combine ancestors as full-width rects ---
-    ancestor_rects = [(node, 0, WIDTH, i) for i, node in enumerate(ancestors)]
-    rects_to_render = ancestor_rects + rects
-
-    # --- draw child window ---
-    remove_item("flamegraph-container")
-    with dpg.child_window(width=WIDTH, height=WINDOW_HEIGHT, border=False, tag="flamegraph-container", parent="flamegraph-window"):
-        print(f"drawing child window item {root}")
-
-        # invert y so depth 0 is at bottom
-        max_depth = max(depth for _, _, _, depth in rects_to_render) if rects_to_render else 0
-        # compute total used height
-        total_height = (max_depth + 1) * RECT_HEIGHT
-        y_offset = max(0, WINDOW_HEIGHT - total_height)  # push down if smaller than window
-
-        for i, (node, x0, x1, depth) in enumerate(rects_to_render):
-            width = max(x1 - x0, 1)
-            y = (max_depth - depth) * RECT_HEIGHT + y_offset
-
-            label = func_label(node.func_id) if width > 60 else ""
-            if node.parent is None:
-                label = "[all]"
-
-            tag = f"func_button_{i}"
-
-            # get path for coloring
-            path = id_to_path.get(node.func_id, "[unknown]")
-            rgb = pc.color(path)
-            color = [int(c*255) for c in rgb] + [255]
-
-            with dpg.theme() as color_theme:
-                with dpg.theme_component(dpg.mvAll):
-                    dpg.add_theme_color(dpg.mvThemeCol_Button, tuple(color))
-                    dpg.add_theme_color(dpg.mvThemeCol_Text, (0,0,0,255))  # black text
-
-            dpg.add_button(
-                label=label,
-                pos=(x0, y),
-                width=width,
-                height=RECT_HEIGHT,
-                callback=lambda s,a,u: draw_flamegraph(u),
-                user_data=node,
-                tag=tag
-            )
-            dpg.bind_item_theme(tag, color_theme)
-            dpg.set_y_scroll("flamegraph-container", max_depth * RECT_HEIGHT)
-
-    # auto-scroll to bottom
-    dpg.set_y_scroll("flamegraph-container", max_depth * RECT_HEIGHT)
-
-# ---------------- Pick a command ---------------- #
-
-# perf.callstacks: {command_name: [stacks]}
-print("Available commands:")
-for cmd in perf.callstacks:
-    print(" -", cmd)
-
-# just pick the first one for now
-#command = next(iter(perf.callstacks))
-command = "head"
-#command = "perf"
-print(f"\nUsing command: {command}")
-
-stacks = perf.callstacks[command]
-
-# IMPORTANT: ensure sorted
-stacks.sort()
-
-# ---------------- Build + run ---------------- #
-
-root = build_flamegraph(stacks)
-
-dpg.create_context()
-
-
-with dpg.window(label="Flamegraph", tag="flamegraph-window"):
-    draw_flamegraph(root)
-pc.draw_legend()
-
-dpg.create_viewport(title="Flamegraph", width=1500, height=900)
-dpg.setup_dearpygui()
-dpg.show_viewport()
-
-while dpg.is_dearpygui_running():
-    dpg.render_dearpygui_frame()
-
-dpg.destroy_context()
+Application().run()

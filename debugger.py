@@ -61,50 +61,40 @@ class Debugger:
         #breakpoint()
         print(addr)
         return addr.GetFunction().name, 10
+    def byte_to_line_histogram(self, byte_hist, function_name):
+        """
+        Convert a byte offset histogram to a line offset histogram using LLDB.
+        Uses modern LLDB Python API: SBSymbolContext -> SBSymbol -> SBAddress.
+        """
+        target = self.target
+        line_hist = {}
 
-    def list_function(self, func_name, num_lines=50):
-        # Find functions by name
-        funcs = self.target.FindFunctions(func_name)
+        # 1️⃣ Find the function symbol
+        symbol_list = target.FindFunctions(function_name)
+        if symbol_list.GetSize() == 0:
+            raise ValueError(f"Function '{function_name}' not found in target modules.")
 
-        if funcs.GetSize() == 0:
-            print(f"Function '{func_name}' not found")
-            return
+        sym_ctx = symbol_list.GetContextAtIndex(0)
+        sym = sym_ctx.symbol
+        if not sym.IsValid():
+            raise ValueError(f"Symbol for function '{function_name}' is invalid.")
 
-        # for now, just take the first function that matches that name
-        func = funcs.GetContextAtIndex(0).GetFunction()
-        if not func or not func.IsValid():
-            print(f"Invalid function for '{func_name}'")
-            return
+        # 2️⃣ Get function start address
+        start_addr = sym.GetStartAddress()
+        base_line_entry = start_addr.GetLineEntry()
+        base_line = base_line_entry.GetLine() if base_line_entry.IsValid() else 0
 
-        # Get start line entry
-        start_addr = func.GetStartAddress()
-        line_entry = start_addr.GetLineEntry()
+        # 3️⃣ Map each byte offset to its corresponding line
+        for byte_offset, count in byte_hist.items():
+            # Create a copy of the start address for this offset
+            addr = lldb.SBAddress(start_addr)
+            if not addr.OffsetAddress(byte_offset):
+                # fallback: treat as unknown line
+                line_off = -1
+            else:
+                le = addr.GetLineEntry()
+                line_off = le.GetLine() - base_line if le.IsValid() else -1
 
-        if not line_entry.IsValid():
-            print(f"No debug line info for '{func_name}'")
-            return
+            line_hist[line_off] = line_hist.get(line_off, 0) + count
 
-        file_spec = line_entry.GetFileSpec()
-        line_no = line_entry.GetLine()
-
-        file_path = file_spec.fullpath
-        if not file_path:
-            print("No file path available")
-            return
-
-        # Read file and print lines
-        try:
-            with open(file_path, "r") as f:
-                lines = f.readlines()
-        except Exception as e:
-            print(f"Failed to read source file: {e}")
-            return
-
-        start = max(0, line_no - 1)
-        end = min(len(lines), start + num_lines)
-
-        text = ""
-        for i in range(max(start-5, 0), end):
-            text += f"{i+1:5d}: {lines[i].rstrip()}\n"
-        #text += "</code></pre>"
-        return text
+        return line_hist

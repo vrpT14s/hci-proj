@@ -28,13 +28,15 @@ class PerfParser:
         for comm in self.callstacks:
             self.callstacks[comm] = sorted(self.callstacks[comm])
 
-        save_file = os.environ.get("SAVE_FILE", "callstacks.pickle")
-        print(f"Finished processing, saving to {save_file}")
+        import flamegraph
+        fgs = flamegraph.Flamegraphs(self.callstacks, self.function_names, executable_path=os.environ["SOURCE_EXE"])
 
+        save_file = os.environ.get("SAVE_FILE", "flamegraphs.pickle")
+        print(f"Finished processing, saving to {save_file}")
 
         import pickle
         with open(save_file, 'wb') as f:
-            pickle.dump(self, f)
+            pickle.dump(fgs, f)
         print("Saved.")
 
     def _install_function(self, func_name):
@@ -65,6 +67,7 @@ class PerfParser:
 parser = None
 
 def trace_begin():
+    global parser
     parser = PerfParser()
 
 def process_event(param_dict):

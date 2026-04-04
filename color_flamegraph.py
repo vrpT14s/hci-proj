@@ -85,12 +85,6 @@ class PathColorizer:
 
     def draw_legend(self, parent="legend_window"):
         import dearpygui.dearpygui as dpg
-        if dpg.does_item_exist(parent):
-            dpg.delete_item(parent, children_only=True)
-        else:
-            with dpg.window(label="Legend", tag=parent, width=200, height=300):
-                pass
-
         def add_entry(name, rgb):
             color = [int(c*255) for c in rgb] + [255]
             with dpg.group(parent=parent, horizontal=True):
