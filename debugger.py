@@ -1,7 +1,19 @@
-import lldb
+try:
+    import lldb
+except ImportError:
+    lldb = None
 
 class Debugger:
     def __init__(self, executable):
+        self.available = lldb is not None
+        self.executable = executable
+
+        if not self.available:
+            self.debugger = None
+            self.target = None
+            print("Warning: LLDB Python module not available. Symbol/line resolution disabled.")
+            return
+
         # Initialize LLDB debugger
         self.debugger = lldb.SBDebugger.Create()
         self.debugger.SetAsync(False)
@@ -16,6 +28,8 @@ class Debugger:
         Resolve a perf symbol name to 'file:line' using LLDB.
         Returns None if not found.
         """
+        if not self.available:
+            return None
 
         # 1. Try direct symbol lookup (best for perf)
         symbols = self.target.FindSymbols(name)
@@ -52,6 +66,8 @@ class Debugger:
         return f"{full_path}:{line}"
 
     def resolve_addr(self, ip):
+        if not self.available:
+            return None, None
         #addr = self.target.ResolveLoadAddress(ip)
         addr = self.target.modules[0].ResolveFileAddress(ip)
         assert len(self.target.modules) == 1
@@ -66,6 +82,9 @@ class Debugger:
         Convert a byte offset histogram to a line offset histogram using LLDB.
         Uses modern LLDB Python API: SBSymbolContext -> SBSymbol -> SBAddress.
         """
+        if not self.available:
+            return {}
+
         target = self.target
         line_hist = {}
 
