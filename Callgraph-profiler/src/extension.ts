@@ -5,6 +5,44 @@ type BridgePayload =
     | { action: 'select_location'; path: string; line: number }
     | { action: 'select_function'; function: string };
 
+type ExecutionLocation = {
+    file?: string;
+    line?: number;
+    name?: string;
+};
+
+type EditorLocation = {
+    file: string;
+    line: number;
+    name?: string;
+};
+
+function hasMeaningfulLocation(loc: ExecutionLocation | undefined): boolean {
+    if (!loc) {
+        return false;
+    }
+    return Boolean(loc.file || loc.name || (typeof loc.line === 'number' && loc.line > 0));
+}
+
+function getExecutionLocationFromActiveStackItem(): ExecutionLocation | undefined {
+    const item = vscode.debug.activeStackItem as unknown as {
+        name?: string;
+        source?: { uri?: { fsPath?: string } };
+        range?: { start?: { line?: number } };
+    } | undefined;
+
+    if (!item) {
+        return undefined;
+    }
+
+    const line0 = item.range?.start?.line;
+    return {
+        name: item.name,
+        file: item.source?.uri?.fsPath,
+        line: typeof line0 === 'number' ? line0 + 1 : undefined
+    };
+}
+
 let selectionSyncTimer: NodeJS.Timeout | undefined;
 
 function getBridgeConfig() {
@@ -59,6 +97,14 @@ async function postBridgeCommand(payload: BridgePayload): Promise<void> {
     });
 }
 
+async function tryPostBridgeCommand(payload: BridgePayload): Promise<void> {
+    try {
+        await postBridgeCommand(payload);
+    } catch {
+        // Bridge is optional; ignore connection issues when app is not running.
+    }
+}
+
 async function pingBridge(): Promise<boolean> {
     const { enabled, host, port } = getBridgeConfig();
     if (!enabled) {
@@ -101,7 +147,196 @@ async function syncEditorLocationToBridge(editor: vscode.TextEditor): Promise<vo
     });
 }
 
+function findCallableSymbolAtLine(symbols: vscode.DocumentSymbol[], line: number): vscode.DocumentSymbol | undefined {
+    const flat = flattenSymbols(symbols).filter(isCallableSymbol);
+    let best: vscode.DocumentSymbol | undefined;
+
+    for (const sym of flat) {
+        if (sym.range.start.line <= line && line <= sym.range.end.line) {
+            if (!best) {
+                best = sym;
+                continue;
+            }
+            const bestSpan = best.range.end.line - best.range.start.line;
+            const curSpan = sym.range.end.line - sym.range.start.line;
+            if (curSpan <= bestSpan) {
+                best = sym;
+            }
+        }
+    }
+    return best;
+}
+
+async function resolveEditorLocation(editor: vscode.TextEditor): Promise<EditorLocation> {
+    const file = editor.document.uri.fsPath;
+    const line = editor.selection.active.line + 1;
+
+    let name: string | undefined;
+    try {
+        const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+            'vscode.executeDocumentSymbolProvider',
+            editor.document.uri
+        );
+        if (symbols && symbols.length > 0) {
+            name = findCallableSymbolAtLine(symbols, editor.selection.active.line)?.name;
+        }
+    } catch {
+        // best effort only
+    }
+
+    return { file, line, name };
+}
+
+async function openFileAtLocation(file: string, oneBasedLine: number): Promise<vscode.TextEditor> {
+    const uri = vscode.Uri.file(file);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    const editor = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+
+    const line = Number.isFinite(oneBasedLine) && oneBasedLine > 0 ? oneBasedLine - 1 : 0;
+    const position = new vscode.Position(line, 0);
+
+    editor.selection = new vscode.Selection(position, position);
+    editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+    return editor;
+}
+
+function breakpointExists(file: string, oneBasedLine: number): boolean {
+    const zeroBased = Math.max(oneBasedLine - 1, 0);
+    return vscode.debug.breakpoints.some(bp => {
+        if (!(bp instanceof vscode.SourceBreakpoint)) {
+            return false;
+        }
+        return bp.location.uri.fsPath === file && bp.location.range.start.line === zeroBased;
+    });
+}
+
+function addBreakpointAtLocation(file: string, oneBasedLine: number): void {
+    if (breakpointExists(file, oneBasedLine)) {
+        return;
+    }
+    const line = Math.max(oneBasedLine - 1, 0);
+    const location = new vscode.Location(vscode.Uri.file(file), new vscode.Position(line, 0));
+    const bp = new vscode.SourceBreakpoint(location, true);
+    vscode.debug.addBreakpoints([bp]);
+}
+
+function removeBreakpointAtLocation(file: string, oneBasedLine: number): void {
+    const zeroBased = Math.max(oneBasedLine - 1, 0);
+    const toRemove = vscode.debug.breakpoints.filter(bp => {
+        if (!(bp instanceof vscode.SourceBreakpoint)) {
+            return false;
+        }
+        return bp.location.uri.fsPath === file && bp.location.range.start.line === zeroBased;
+    });
+
+    if (toRemove.length > 0) {
+        vscode.debug.removeBreakpoints(toRemove);
+    }
+}
+
+function toggleBreakpointAtLocation(file: string, oneBasedLine: number): boolean {
+    const exists = breakpointExists(file, oneBasedLine);
+    if (exists) {
+        removeBreakpointAtLocation(file, oneBasedLine);
+        return false;
+    }
+
+    addBreakpointAtLocation(file, oneBasedLine);
+    return true;
+}
+
+async function queryExecutionLocation(
+    session: vscode.DebugSession,
+    preferredThreadId?: number
+): Promise<ExecutionLocation | undefined> {
+    try {
+        const threadsResp = await session.customRequest('threads') as {
+            threads?: Array<{ id: number; name: string }>;
+        };
+        const threads = threadsResp?.threads ?? [];
+        if (threads.length === 0) {
+            return undefined;
+        }
+
+        const thread = threads.find(t => t.id === preferredThreadId) ?? threads[0];
+        const stackResp = await session.customRequest('stackTrace', {
+            threadId: thread.id,
+            startFrame: 0,
+            levels: 1
+        }) as {
+            stackFrames?: Array<{
+                name?: string;
+                line?: number;
+                source?: { path?: string };
+            }>;
+        };
+
+        const frame = stackResp?.stackFrames?.[0];
+        if (!frame) {
+            return undefined;
+        }
+
+        return {
+            name: frame.name,
+            line: frame.line,
+            file: frame.source?.path
+        };
+    } catch {
+        return undefined;
+    }
+}
+
 export function activate(context: vscode.ExtensionContext) {
+    let graphPanel: vscode.WebviewPanel | undefined;
+    let currentExecLocation: ExecutionLocation | undefined;
+    let lastStoppedThreadId: number | undefined;
+
+    const postExecLocation = () => {
+        if (!graphPanel) {
+            return;
+        }
+        graphPanel.webview.postMessage({
+            command: 'execLocation',
+            location: currentExecLocation ?? null
+        });
+    };
+
+    const postEditorLocationToGraph = async (editor?: vscode.TextEditor) => {
+        if (!graphPanel) {
+            return;
+        }
+        const activeEditor = editor ?? vscode.window.activeTextEditor;
+        if (!activeEditor || activeEditor.document.uri.scheme !== 'file') {
+            return;
+        }
+
+        const loc = await resolveEditorLocation(activeEditor);
+        graphPanel.webview.postMessage({
+            command: 'editorLocation',
+            location: loc
+        });
+    };
+
+    const refreshExecutionLocation = async (threadId?: number, session?: vscode.DebugSession) => {
+        const fromActiveItem = getExecutionLocationFromActiveStackItem();
+        if (hasMeaningfulLocation(fromActiveItem)) {
+            currentExecLocation = fromActiveItem;
+            postExecLocation();
+            return;
+        }
+
+        const activeSession = session ?? vscode.debug.activeDebugSession;
+        if (!activeSession) {
+            currentExecLocation = undefined;
+            postExecLocation();
+            return;
+        }
+
+        const preferredThread = threadId ?? lastStoppedThreadId;
+        currentExecLocation = await queryExecutionLocation(activeSession, preferredThread);
+        postExecLocation();
+    };
+
     const disposable = vscode.commands.registerCommand('callgraph-profiler.showGraph', async () => {
         const panel = vscode.window.createWebviewPanel(
             'callGraph',
@@ -109,34 +344,77 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.ViewColumn.Two,
             { enableScripts: true }
         );
+        graphPanel = panel;
+        panel.onDidDispose(() => {
+            if (graphPanel === panel) {
+                graphPanel = undefined;
+            }
+        });
 
-        const graph = await buildGraphData();
+        let graph: GraphData;
+        try {
+            graph = await buildGraphData();
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : 'Failed to build callgraph.';
+            graph = { nodes: [], edges: [], title: `Callgraph unavailable: ${msg}` };
+        }
         panel.webview.html = getWebviewContent(graph);
+        await refreshExecutionLocation();
+        await postEditorLocationToGraph(vscode.window.activeTextEditor ?? undefined);
 
         panel.webview.onDidReceiveMessage(
             async message => {
-                if (message.command !== 'openFile') {
-                    return;
-                }
-
                 try {
-                    const uri = vscode.Uri.file(message.file);
-                    const doc = await vscode.workspace.openTextDocument(uri);
-                    const editor = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
-
-                    const line = Number.isFinite(message.line) && message.line > 0 ? message.line - 1 : 0;
-                    const position = new vscode.Position(line, 0);
-
-                    editor.selection = new vscode.Selection(position, position);
-                    editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
-
-                    await postBridgeCommand({
-                        action: 'select_location',
-                        path: uri.fsPath,
-                        line: line + 1
-                    });
-                } catch {
-                    vscode.window.showErrorMessage(`Could not open file: ${message.file}`);
+                    switch (message.command) {
+                        case 'openFile': {
+                            const editor = await openFileAtLocation(message.file, message.line);
+                            await tryPostBridgeCommand({
+                                action: 'select_location',
+                                path: editor.document.uri.fsPath,
+                                line: Math.max(Number(message.line) || 1, 1)
+                            });
+                            return;
+                        }
+                        case 'setBreakpoint': {
+                            const enabled = toggleBreakpointAtLocation(message.file, message.line);
+                            panel.webview.postMessage({
+                                command: 'breakpointState',
+                                file: message.file,
+                                line: message.line,
+                                exists: enabled
+                            });
+                            vscode.window.showInformationMessage(
+                                enabled
+                                    ? `Breakpoint set at ${message.file}:${message.line}`
+                                    : `Breakpoint removed at ${message.file}:${message.line}`
+                            );
+                            await tryPostBridgeCommand({
+                                action: 'select_location',
+                                path: message.file,
+                                line: Math.max(Number(message.line) || 1, 1)
+                            });
+                            return;
+                        }
+                        case 'queryBreakpoint': {
+                            const exists = breakpointExists(message.file, message.line);
+                            panel.webview.postMessage({
+                                command: 'breakpointState',
+                                file: message.file,
+                                line: message.line,
+                                exists
+                            });
+                            return;
+                        }
+                        case 'revealEditor': {
+                            await postEditorLocationToGraph(vscode.window.activeTextEditor ?? undefined);
+                            return;
+                        }
+                        default:
+                            return;
+                    }
+                } catch (error) {
+                    const msg = error instanceof Error ? error.message : 'Action failed.';
+                    vscode.window.showErrorMessage(msg);
                 }
             },
             undefined,
@@ -172,6 +450,23 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    const setBreakpointCursorDisposable = vscode.commands.registerCommand('callgraph-profiler.setBreakpointAtCursor', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || editor.document.uri.scheme !== 'file') {
+            vscode.window.showWarningMessage('No active file editor.');
+            return;
+        }
+
+        const file = editor.document.uri.fsPath;
+        const line = editor.selection.active.line + 1;
+        addBreakpointAtLocation(file, line);
+        vscode.window.showInformationMessage(`Breakpoint set at ${file}:${line}`);
+    });
+
+    const revealEditorDisposable = vscode.commands.registerCommand('callgraph-profiler.revealEditorInGraph', async () => {
+        await postEditorLocationToGraph(vscode.window.activeTextEditor ?? undefined);
+    });
+
     const selectionDisposable = vscode.window.onDidChangeTextEditorSelection(async (evt) => {
         if (selectionSyncTimer) {
             clearTimeout(selectionSyncTimer);
@@ -183,13 +478,55 @@ export function activate(context: vscode.ExtensionContext) {
             } catch {
                 // Ignore transient bridge failures for passive sync.
             }
+
+            try {
+                await postEditorLocationToGraph(evt.textEditor);
+            } catch {
+                // Ignore passive graph sync errors.
+            }
         }, 180);
+    });
+
+    const debugStartDisposable = vscode.debug.onDidStartDebugSession(async (session) => {
+        await refreshExecutionLocation(undefined, session);
+    });
+
+    const debugChangeDisposable = vscode.debug.onDidChangeActiveDebugSession(async (session) => {
+        await refreshExecutionLocation(undefined, session ?? undefined);
+    });
+
+    const debugTerminateDisposable = vscode.debug.onDidTerminateDebugSession(async (session) => {
+        if (vscode.debug.activeDebugSession === session || !vscode.debug.activeDebugSession) {
+            currentExecLocation = undefined;
+            postExecLocation();
+        }
+    });
+
+    const debugCustomEventDisposable = vscode.debug.onDidReceiveDebugSessionCustomEvent(async (evt) => {
+        if (evt.event === 'stopped') {
+            const body = evt.body as { threadId?: number } | undefined;
+            lastStoppedThreadId = body?.threadId;
+            await refreshExecutionLocation(body?.threadId, evt.session);
+        } else if (evt.event === 'continued') {
+            await refreshExecutionLocation(undefined, evt.session);
+        }
+    });
+
+    const stackItemDisposable = vscode.debug.onDidChangeActiveStackItem(async () => {
+        await refreshExecutionLocation();
     });
 
     context.subscriptions.push(disposable);
     context.subscriptions.push(pingDisposable);
     context.subscriptions.push(syncDisposable);
+    context.subscriptions.push(setBreakpointCursorDisposable);
+    context.subscriptions.push(revealEditorDisposable);
     context.subscriptions.push(selectionDisposable);
+    context.subscriptions.push(debugStartDisposable);
+    context.subscriptions.push(debugChangeDisposable);
+    context.subscriptions.push(debugTerminateDisposable);
+    context.subscriptions.push(debugCustomEventDisposable);
+    context.subscriptions.push(stackItemDisposable);
 }
 
 type GraphNode = {
@@ -240,10 +577,15 @@ function flattenSymbols(symbols: vscode.DocumentSymbol[]): vscode.DocumentSymbol
 async function buildCallHierarchyGraph(editor: vscode.TextEditor): Promise<GraphData | null> {
     const uri = editor.document.uri;
 
-    const symbolTree = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-        'vscode.executeDocumentSymbolProvider',
-        uri
-    );
+    let symbolTree: vscode.DocumentSymbol[] | undefined;
+    try {
+        symbolTree = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+            'vscode.executeDocumentSymbolProvider',
+            uri
+        );
+    } catch {
+        return null;
+    }
     if (!symbolTree || symbolTree.length === 0) {
         return null;
     }
@@ -326,10 +668,15 @@ async function buildSymbolFallbackGraph(): Promise<GraphData> {
     const edges = new Map<string, GraphEdge>();
 
     for (const uri of files) {
-        const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-            'vscode.executeDocumentSymbolProvider',
-            uri
-        );
+        let symbols: vscode.DocumentSymbol[] | undefined;
+        try {
+            symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+                'vscode.executeDocumentSymbolProvider',
+                uri
+            );
+        } catch {
+            continue;
+        }
         if (!symbols || symbols.length === 0) {
             continue;
         }
@@ -400,10 +747,39 @@ function getWebviewContent(graph: GraphData) {
 </head>
 <body>
     <div id="title" style="position:fixed;top:8px;left:8px;z-index:10;color:#ddd;font-family:sans-serif;font-size:12px;">${graph.title}</div>
+    <div id="toolbar" style="position:fixed;top:30px;left:8px;z-index:10;display:flex;gap:8px;align-items:center;background:#252526;border:1px solid #333;border-radius:8px;padding:8px;">
+        <button id="openBtn" disabled>Open</button>
+        <button id="bpBtn" disabled>Set Breakpoint</button>
+        <button id="revealBtn">Reveal Editor</button>
+        <span id="selInfo" style="color:#ddd;font-family:sans-serif;font-size:12px;max-width:65vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+    </div>
+    <div id="execInfo" style="position:fixed;top:68px;left:8px;z-index:10;color:#ddd;font-family:sans-serif;font-size:12px;background:#252526;border:1px solid #333;border-radius:8px;padding:6px 8px;">
+        Current debug frame: (none)
+    </div>
     <div id="cy"></div>
     <script>
         const vscode = acquireVsCodeApi();
         const elements = ${JSON.stringify(elements)};
+        let selectedNode = null;
+        let execLocation = null;
+        let editorLocation = null;
+
+        function normalizeName(name) {
+            if (!name) return '';
+            return String(name)
+                .replace(/\(.*\)$/, '')
+                .replace(/^.*::/, '')
+                .trim();
+        }
+
+        function refreshBreakpointButton() {
+            const btn = document.getElementById('bpBtn');
+            if (!selectedNode) {
+                btn.textContent = 'Set Breakpoint';
+                return;
+            }
+            btn.textContent = selectedNode.hasBreakpoint ? 'Remove Breakpoint' : 'Set Breakpoint';
+        }
 
         var cy = cytoscape({
             container: document.getElementById('cy'),
@@ -436,7 +812,203 @@ function getWebviewContent(graph: GraphData) {
             layout: { name: elements.some(e => e.data.source) ? 'cose' : 'grid', fit: true, padding: 40 }
         });
 
+        function applyExecutionHighlight() {
+            cy.nodes().removeClass('current-exec');
+            const info = document.getElementById('execInfo');
+
+            if (!execLocation) {
+                info.textContent = 'Current debug frame: (none)';
+                return;
+            }
+
+            const name = execLocation.name || '(unknown)';
+            const file = execLocation.file || '(no file)';
+            const line = execLocation.line || '?';
+            info.textContent = 'Current debug frame: ' + name + ' — ' + file + ':' + line;
+
+            let bestNode = null;
+            let bestScore = Number.POSITIVE_INFINITY;
+
+            cy.nodes().forEach(n => {
+                const nodeFile = String(n.data('file') || '');
+                const execFile = String(execLocation.file || '');
+                const nodeLine = Number(n.data('line') || 0);
+                const execLine = Number(execLocation.line || 0);
+
+                const sameFile = execFile && nodeFile && (
+                    nodeFile === execFile ||
+                    nodeFile.split('/').pop() === execFile.split('/').pop()
+                );
+                const sameName = normalizeName(execLocation.name) &&
+                    normalizeName(n.data('label')) === normalizeName(execLocation.name);
+
+                if (!sameFile && !sameName) {
+                    return;
+                }
+
+                let score = 0;
+                if (sameFile) {
+                    score += 0;
+                    if (execLine > 0 && nodeLine > 0) {
+                        score += Math.abs(nodeLine - execLine);
+                    }
+                } else {
+                    score += 500;
+                }
+
+                if (sameName) {
+                    score -= 100;
+                } else {
+                    score += 50;
+                }
+
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestNode = n;
+                }
+            });
+
+            if (bestNode) {
+                bestNode.addClass('current-exec');
+            }
+        }
+
+        function applyEditorFocus() {
+            cy.nodes().removeClass('editor-focus');
+            if (!editorLocation) {
+                return;
+            }
+
+            const targetFile = String(editorLocation.file || '');
+            const targetLine = Number(editorLocation.line || 0);
+            const targetName = normalizeName(editorLocation.name);
+
+            let bestNode = null;
+            let bestScore = Number.POSITIVE_INFINITY;
+
+            cy.nodes().forEach(n => {
+                const nodeFile = String(n.data('file') || '');
+                const nodeLine = Number(n.data('line') || 0);
+                const nodeName = normalizeName(n.data('label'));
+
+                const sameFile = targetFile && (nodeFile === targetFile || nodeFile.split('/').pop() === targetFile.split('/').pop());
+                const sameName = targetName && nodeName === targetName;
+
+                if (!sameFile && !sameName) {
+                    return;
+                }
+
+                let score = 0;
+                if (sameFile) {
+                    score += Math.abs(nodeLine - targetLine);
+                } else {
+                    score += 1000;
+                }
+                if (!sameName) {
+                    score += 25;
+                }
+
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestNode = n;
+                }
+            });
+
+            if (bestNode) {
+                bestNode.addClass('editor-focus');
+                setSelected({
+                    label: bestNode.data('label'),
+                    file: bestNode.data('file'),
+                    line: bestNode.data('line'),
+                    hasBreakpoint: false
+                });
+                cy.animate({ center: { eles: bestNode }, duration: 200 });
+            }
+        }
+
+        function setSelected(node) {
+            selectedNode = node;
+            document.getElementById('openBtn').disabled = !selectedNode;
+            document.getElementById('bpBtn').disabled = !selectedNode;
+            refreshBreakpointButton();
+            document.getElementById('selInfo').textContent = selectedNode
+                ? (selectedNode.label + ' — ' + selectedNode.file + ':' + selectedNode.line)
+                : '';
+
+            if (selectedNode) {
+                vscode.postMessage({
+                    command: 'queryBreakpoint',
+                    file: selectedNode.file,
+                    line: selectedNode.line
+                });
+            }
+        }
+
+        window.addEventListener('message', event => {
+            const message = event.data;
+            if (!message) {
+                return;
+            }
+
+            if (message.command === 'execLocation') {
+                execLocation = message.location;
+                applyExecutionHighlight();
+                return;
+            }
+
+            if (message.command === 'editorLocation') {
+                editorLocation = message.location;
+                applyEditorFocus();
+                return;
+            }
+
+            if (message.command !== 'breakpointState') {
+                return;
+            }
+
+            if (
+                selectedNode &&
+                selectedNode.file === message.file &&
+                Number(selectedNode.line) === Number(message.line)
+            ) {
+                selectedNode.hasBreakpoint = !!message.exists;
+                refreshBreakpointButton();
+            }
+        });
+
+        document.getElementById('openBtn').addEventListener('click', () => {
+            if (!selectedNode) return;
+            vscode.postMessage({
+                command: 'openFile',
+                file: selectedNode.file,
+                line: selectedNode.line
+            });
+        });
+
+        document.getElementById('bpBtn').addEventListener('click', () => {
+            if (!selectedNode) return;
+            vscode.postMessage({
+                command: 'setBreakpoint',
+                file: selectedNode.file,
+                line: selectedNode.line
+            });
+        });
+
+        document.getElementById('revealBtn').addEventListener('click', () => {
+            vscode.postMessage({ command: 'revealEditor' });
+        });
+
         cy.on('tap', 'node', function(evt){
+            var node = evt.target;
+            setSelected({
+                label: node.data('label'),
+                file: node.data('file'),
+                line: node.data('line'),
+                hasBreakpoint: false
+            });
+        });
+
+        cy.on('dbltap', 'node', function(evt){
             var node = evt.target;
             vscode.postMessage({
                 command: 'openFile',
@@ -444,6 +1016,20 @@ function getWebviewContent(graph: GraphData) {
                 line: node.data('line')
             });
         });
+
+        cy.style()
+            .selector('node.current-exec')
+            .style({
+                'background-color': '#f39c12',
+                'border-width': 3,
+                'border-color': '#f1c40f'
+            })
+            .selector('node.editor-focus')
+            .style({
+                'border-width': 4,
+                'border-color': '#2ecc71'
+            })
+            .update();
     </script>
 </body>
 </html>`;

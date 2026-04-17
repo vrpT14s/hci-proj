@@ -26,6 +26,16 @@
         "command": "callgraph-profiler.syncSelectionToApp",
         "title": "Sync Current Selection to App",
         "category": "Callgraph Profiler"
+      },
+      {
+        "command": "callgraph-profiler.setBreakpointAtCursor",
+        "title": "Set Breakpoint At Cursor",
+        "category": "Callgraph Profiler"
+      },
+      {
+        "command": "callgraph-profiler.revealEditorInGraph",
+        "title": "Reveal Editor Location In Call Graph",
+        "category": "Callgraph Profiler"
       }
     ],
     "configuration": {
