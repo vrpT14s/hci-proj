@@ -1,1 +1,15 @@
 __pycache__/
+.venv/
+
+# Python build/runtime artifacts
+*.py[cod]
+*.pyo
+*.pyd
+
+# OS/editor noise
+.DS_Store
+
+# VS Code extension artifacts (if committed from root repo)
+Callgraph-profiler/node_modules/
+Callgraph-profiler/out/
+Callgraph-profiler/.vscode-test/
