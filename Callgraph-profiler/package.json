@@ -1,0 +1,70 @@
+{
+  "name": "callgraph-profiler",
+  "displayName": "callgraph-profiler",
+  "description": "",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "callgraph-profiler.showGraph",
+        "title": "Show Call Graph",
+        "category": "Callgraph Profiler"
+      },
+      {
+        "command": "callgraph-profiler.pingBridge",
+        "title": "Ping Python App Bridge",
+        "category": "Callgraph Profiler"
+      },
+      {
+        "command": "callgraph-profiler.syncSelectionToApp",
+        "title": "Sync Current Selection to App",
+        "category": "Callgraph Profiler"
+      }
+    ],
+    "configuration": {
+      "title": "Callgraph Profiler",
+      "properties": {
+        "callgraphProfiler.bridge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable sending editor/graph selections to the Python app bridge."
+        },
+        "callgraphProfiler.bridge.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host where the Python app bridge is listening."
+        },
+        "callgraphProfiler.bridge.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Port where the Python app bridge is listening."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.110.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
