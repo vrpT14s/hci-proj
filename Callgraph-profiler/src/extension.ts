@@ -17,6 +17,85 @@ type EditorLocation = {
     name?: string;
 };
 
+//------------line-coverage-decorations--------------------------------------
+// ============================================================================
+// 1. DYNAMIC HEAT DECORATION SETUP (YELLOW TO GREEN)
+// ============================================================================
+const HEAT_LEVELS = 5;
+const heatDecorations: vscode.TextEditorDecorationType[] = [];
+
+for (let i = 0; i < HEAT_LEVELS; i++) {
+    const opacity = 0.15 + (i * 0.075);
+
+    // Keep green at 255, scale red from 255 down to 0
+    // Level 0: Red 255, Green 255 (Yellow)
+    // Level 4: Red 0, Green 255 (Green)
+    const green = 255;
+    const red = 255 - Math.floor((255 / (HEAT_LEVELS - 1)) * i);
+
+    heatDecorations.push(vscode.window.createTextEditorDecorationType({
+        backgroundColor: `rgba(${red}, ${green}, 0, ${opacity})`,
+        isWholeLine: true,
+        overviewRulerColor: `rgba(${red}, ${green}, 0, 0.8)`,
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+        after: {
+            margin: '0 0 0 3em',
+            // Match the text color to the bucket color but fully opaque
+            color: `rgba(1.0, 1.0, 1.0, 1.0)`
+        }
+    }));
+}
+
+let fileHistograms: Map<string, { [line: string]: number }> = new Map();
+
+// ============================================================================
+// 2. APPLY HEATMAP (WITH PERCENTAGE TEXT)
+// ============================================================================
+function applyHeatmapToEditor(editor: vscode.TextEditor, hits: { [line: string]: number }) {
+    heatDecorations.forEach(decorationType => {
+        editor.setDecorations(decorationType, []);
+    });
+    // Clear out any old decorations
+    heatDecorations.forEach(dec => editor.setDecorations(dec, []));
+
+    const hitValues = Object.values(hits);
+    if (hitValues.length === 0) return;
+
+    // We need both maxHits (for the color bucket) and totalHits (for the percentage text)
+    const maxHits = Math.max(...hitValues);
+    const totalHits = hitValues.reduce((sum, val) => sum + val, 0);
+
+    const decorationBuckets: vscode.DecorationOptions[][] = Array.from({ length: HEAT_LEVELS }, () => []);
+
+    for (const [lineStr, count] of Object.entries(hits)) {
+        const line = parseInt(lineStr, 10) - 1; // 0-based index
+        if (line < 0) continue;
+
+        // Calculate bucket color index based on max line
+        const heatRatio = count / maxHits;
+        let bucketIndex = Math.floor(heatRatio * HEAT_LEVELS);
+        if (bucketIndex >= HEAT_LEVELS) bucketIndex = HEAT_LEVELS - 1; // Clamp max
+
+        // Calculate the percentage relative to the whole function
+        const percentage = ((count / totalHits) * 100).toFixed(1);
+
+        decorationBuckets[bucketIndex].push({
+            range: new vscode.Range(line, 0, line, 0),
+            renderOptions: {
+                after: { contentText: `  ${percentage}% [${count} sample${(count > 1) ? 's' : ''}]` }
+            }
+        });
+    }
+
+    // Apply all buckets
+    for (let i = 0; i < HEAT_LEVELS; i++) {
+        if (decorationBuckets[i].length > 0) {
+            editor.setDecorations(heatDecorations[i], decorationBuckets[i]);
+        }
+    }
+}
+//-----------end-line-coverage-decorations--------------------------------
+
 function hasMeaningfulLocation(loc: ExecutionLocation | undefined): boolean {
     if (!loc) {
         return false;
@@ -196,7 +275,23 @@ async function openFileAtLocation(file: string, oneBasedLine: number): Promise<v
     const position = new vscode.Position(line, 0);
 
     editor.selection = new vscode.Selection(position, position);
-    editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+
+    // Instead of InCenter, we use AtTop.
+    // If you want it exactly 25% down, we can "reveal" a line
+    // slightly further down to pull your target line into view.
+    editor.revealRange(
+        new vscode.Range(position, position),
+        vscode.TextEditorRevealType.AtTop
+    );
+
+    // This "nudges" the view so the line isn't hugged against the top tab bar
+    vscode.commands.executeCommand('editorScroll', {
+        to: 'up',
+        by: 'line',
+        value: 8, // Adjust this number to get exactly that "25% down" feel
+        revealCursor: false
+    });
+
     return editor;
 }
 
@@ -286,7 +381,118 @@ async function queryExecutionLocation(
     }
 }
 
+function triggerDiagnosticTest() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+        vscode.window.showErrorMessage("No active editor found! Open a file first.");
+        return;
+    }
+
+    const testDecorationType = vscode.window.createTextEditorDecorationType({
+        backgroundColor: 'rgba(255, 0, 0, 0.3)',
+        isWholeLine: true,
+        after: {
+            contentText: " << DECORATION TEST ACTIVE >>",
+            color: "white",
+            fontWeight: "bold"
+        }
+    });
+
+    const decorations: vscode.DecorationOptions[] = [];
+    const lineCount = editor.document.lineCount;
+
+    for (let i = 0; i < lineCount; i++) {
+        decorations.push({ range: new vscode.Range(i, 0, i, 0) });
+    }
+
+    console.log(`Attempting to decorate ${lineCount} lines...`);
+    editor.setDecorations(testDecorationType, decorations);
+}
+
 export function activate(context: vscode.ExtensionContext) {
+    console.log("Callgraph Profiler Extension Activating");
+
+    const server = http.createServer((req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+
+                // ---------------------------------------------------
+                // ENDPOINT 1: Jump to a specific location
+                // ---------------------------------------------------
+                if (req.method === 'POST' && req.url === '/command') {
+                    if (data.location && typeof data.location === 'string') {
+                        const lastColon = data.location.lastIndexOf(':');
+                        if (lastColon !== -1) {
+                            const filePath = data.location.substring(0, lastColon);
+                            const lineNum = parseInt(data.location.substring(lastColon + 1), 10);
+
+                            if (filePath && !isNaN(lineNum)) {
+                                // Wait for the file to be opened
+                                await openFileAtLocation(filePath, lineNum);
+
+                                res.statusCode = 200;
+                                res.end(JSON.stringify({ ok: true, msg: `Moved to ${filePath}:${lineNum}` }));
+                                return;
+                            }
+                        }
+                    }
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ error: "Invalid payload. Expected {location: 'path:line'}" }));
+                    return;
+                }
+
+                // ---------------------------------------------------
+                // ENDPOINT 2: Apply the line histogram
+                // ---------------------------------------------------
+                else if (req.method === 'POST' && req.url === '/histogram') {
+                    const { path, baseLine, histogram } = data;
+
+                    // 1. Calculate absolute lines from offsets
+                    const absoluteHits: { [line: string]: number } = {};
+                    for (const [offset, count] of Object.entries(histogram)) {
+                        absoluteHits[baseLine + parseInt(offset, 10)] = count as number;
+                    }
+                    fileHistograms.set(path, absoluteHits);
+
+                    // 2. Open file FIRST, then apply to the guaranteed active editor
+                    const editor = await openFileAtLocation(path, baseLine);
+                    applyHeatmapToEditor(editor, absoluteHits);
+
+                    res.statusCode = 200;
+                    res.end(JSON.stringify({ ok: true }));
+                    return;
+                }
+
+                // ---------------------------------------------------
+                // Fallback / Unknown Route
+                // ---------------------------------------------------
+                res.statusCode = 404;
+                res.end(JSON.stringify({ error: "Endpoint Not Found" }));
+
+            } catch (err: any) {
+                console.error("Server Error:", err);
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: err.message || "Internal Server Error" }));
+            }
+        });
+    });
+
+    server.listen(9999, '127.0.0.1', () => {
+        console.log('VS Code Extension Remote Server running at http://127.0.0.1:9999');
+    });
+
+    // Clean up the server when the extension shuts down
+    context.subscriptions.push({
+        dispose: () => server.close()
+    });
+
+
     let graphPanel: vscode.WebviewPanel | undefined;
     let currentExecLocation: ExecutionLocation | undefined;
     let lastStoppedThreadId: number | undefined;

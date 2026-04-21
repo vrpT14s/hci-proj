@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # meant to be called with ```perf script -s <script name> -i <perf.data file>```
 
+from collections import Counter
+import pickle
 import os
 from debugger import Debugger
 from pprint import pp
@@ -9,6 +11,7 @@ class PerfParser:
     def __init__(self):
         #key is (dso, func_name), both can be nullable
         self.function_names = {}
+        self.number_to_ip = {} #number to ip
 
         '''structure of callstacks:
         {
@@ -29,21 +32,21 @@ class PerfParser:
             self.callstacks[comm] = sorted(self.callstacks[comm])
 
         import flamegraph
-        fgs = flamegraph.Flamegraphs(self.callstacks, self.function_names, executable_path=os.environ["SOURCE_EXE"])
+        fgs = flamegraph.Flamegraph(self.callstacks, self.function_names)
 
         save_file = os.environ.get("SAVE_FILE", "flamegraphs.pickle")
         print(f"Finished processing, saving to {save_file}")
 
-        import pickle
         with open(save_file, 'wb') as f:
             pickle.dump(fgs, f)
         print("Saved.")
 
-    def _install_function(self, func_name):
+    def _install_function(self, func_name, ip):
         idx = self.function_names.get(func_name)
         if idx is None:
             idx = len(self.function_names)
             self.function_names[func_name] = idx
+            self.number_to_ip[idx] = ip
         return idx
 
     def add_sample(self, param_dict):
@@ -51,11 +54,13 @@ class PerfParser:
         stack = []
         for frame in param_dict['callchain'][::-1]:
             dso = frame.get('dso')
-            name = frame.get('sym', {}).get('name')
+            sym = frame.get('sym', {})
             offset = frame.get('sym_off')
+            name = sym.get('name')
+            ip = sym.get('start')
 
             stack.append((
-                self._install_function((dso, name)),
+                self._install_function((dso, name), ip),
                 offset
             ))
 

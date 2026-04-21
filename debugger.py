@@ -1,114 +1,126 @@
-try:
-    import lldb
-except ImportError:
-    lldb = None
+import lldb
+import os
 
 class Debugger:
-    def __init__(self, executable):
-        self.available = lldb is not None
-        self.executable = executable
-
-        if not self.available:
-            self.debugger = None
-            self.target = None
-            print("Warning: LLDB Python module not available. Symbol/line resolution disabled.")
-            return
-
-        # Initialize LLDB debugger
+    def __init__(self):
         self.debugger = lldb.SBDebugger.Create()
         self.debugger.SetAsync(False)
 
-        # Create a target from executable
-        self.target = self.debugger.CreateTarget(executable)
-        if not self.target or not self.target.IsValid():
-            raise RuntimeError(f"Failed to create target for {executable}")
+        self.targets = {}
 
-    def lookup_symbol_location(self, name):
-        """
-        Resolve a perf symbol name to 'file:line' using LLDB.
-        Returns None if not found.
-        """
-        if not self.available:
-            return None
-
-        # 1. Try direct symbol lookup (best for perf)
-        symbols = self.target.FindSymbols(name)
-
-        if symbols.GetSize() == 0:
-            # fallback: try function lookup
-            symbols = self.target.FindFunctions(name)
-
-            if symbols.GetSize() == 0:
+    def get_sc_list(self, dso, name):
+        # Resolve kernel symbols
+        if dso == '[kernel.kallsyms]':
+            dso = os.environ.get('VMLINUX')
+            if not dso:
+                print("VMLINUX not set")
                 return None
 
-        sym_ctx = symbols.GetContextAtIndex(0)
-
-        # Prefer function, fallback to symbol
-        obj = sym_ctx.GetFunction() or sym_ctx.GetSymbol()
-        if not obj:
+        target = self.get_target(dso)
+        if not target:
             return None
 
-        addr = obj.GetStartAddress()
-        line_entry = addr.GetLineEntry()
+        def try_find(query, name_type):
+            return target.FindFunctions(query, name_type)
 
-        if not line_entry.IsValid():
+        # ---- 1. Try the most permissive search first ----
+        sc_list = try_find(name, lldb.eFunctionNameTypeAuto)
+
+        # ---- 2. Build fallback candidate names ----
+        if sc_list.GetSize() == 0:
+            candidates = []
+
+            # Strip signature using *last* '('
+            if '(' in name:
+                candidates.append(name.rsplit('(', 1)[0].strip())
+
+            # Strip template arguments
+            if '<' in name:
+                candidates.append(name.split('<', 1)[0].strip())
+
+            # Strip both (common useful fallback)
+            if '(' in name or '<' in name:
+                base = name
+                if '(' in base:
+                    base = base.rsplit('(', 1)[0]
+                if '<' in base:
+                    base = base.split('<', 1)[0]
+                candidates.append(base.strip())
+
+            # Deduplicate while preserving order
+            seen = set()
+            candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+            # Try each candidate
+            for cand in candidates:
+                sc_list = try_find(cand, lldb.eFunctionNameTypeBase)
+                if sc_list.GetSize() > 0:
+                    break
+
+        # ---- 3. If still nothing, give up ----
+        if sc_list.GetSize() == 0:
+            print(f"FAILED TO GET {(dso, name)}")
+            return None
+        return sc_list
+
+    def lookup_symbol_location(self, dso, name):
+        sc_list = self.get_sc_list(dso, name)
+        if sc_list is None:
             return None
 
-        file_spec = line_entry.GetFileSpec()
-        directory = file_spec.GetDirectory()
-        filename = file_spec.GetFilename()
-        line = line_entry.GetLine()
+        for i in range(sc_list.GetSize()):
+            sc = sc_list.GetContextAtIndex(i)
 
-        if filename is None:
-            return None
+            func = sc.GetFunction()
+            if not func.IsValid():
+                continue
 
-        full_path = f"{directory}/{filename}" if directory else filename
-        return f"{full_path}:{line}"
+            start_addr = func.GetStartAddress()
+            line_entry = start_addr.GetLineEntry()
 
-    def resolve_addr(self, ip):
-        if not self.available:
-            return None, None
-        #addr = self.target.ResolveLoadAddress(ip)
-        addr = self.target.modules[0].ResolveFileAddress(ip)
-        assert len(self.target.modules) == 1
-        #if random.randint(0, 10005) == 10000:
-        #    breakpoint()
-        #print(addr, addr.GetFunction())
-        #breakpoint()
-        print(addr)
-        return addr.GetFunction().name, 10
-    def byte_to_line_histogram(self, byte_hist, function_name):
+            if line_entry.IsValid():
+                file_spec = line_entry.GetFileSpec()
+                directory = file_spec.GetDirectory()
+                filename = file_spec.GetFilename()
+                line = line_entry.GetLine()
+
+                if directory and filename:
+                    return f"{directory}/{filename}:{line}"
+
+        return None
+
+    def get_target(self, dso):
+        if self.targets.get(dso) is None:
+            self.targets[dso] = self.debugger.CreateTarget(dso)
+        return self.targets[dso]
+
+    def byte_to_line_histogram(self, byte_hist, dso_func_tuple):
         """
         Convert a byte offset histogram to a line offset histogram using LLDB.
-        Uses modern LLDB Python API: SBSymbolContext -> SBSymbol -> SBAddress.
         """
-        if not self.available:
-            return {}
-
-        target = self.target
         line_hist = {}
 
-        # 1️⃣ Find the function symbol
-        symbol_list = target.FindFunctions(function_name)
-        if symbol_list.GetSize() == 0:
-            raise ValueError(f"Function '{function_name}' not found in target modules.")
+        dso, function_name = dso_func_tuple
+        if function_name is None:
+            return
 
-        sym_ctx = symbol_list.GetContextAtIndex(0)
+        sc_list = self.get_sc_list(dso, function_name)
+        if not sc_list:
+            return
+
+        sym_ctx = sc_list[0]
         sym = sym_ctx.symbol
-        if not sym.IsValid():
-            raise ValueError(f"Symbol for function '{function_name}' is invalid.")
+        if not sym or not sym.IsValid():
+            return
 
-        # 2️⃣ Get function start address
         start_addr = sym.GetStartAddress()
         base_line_entry = start_addr.GetLineEntry()
         base_line = base_line_entry.GetLine() if base_line_entry.IsValid() else 0
 
-        # 3️⃣ Map each byte offset to its corresponding line
         for byte_offset, count in byte_hist.items():
-            # Create a copy of the start address for this offset
             addr = lldb.SBAddress(start_addr)
+
             if not addr.OffsetAddress(byte_offset):
-                # fallback: treat as unknown line
                 line_off = -1
             else:
                 le = addr.GetLineEntry()

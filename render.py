@@ -1,369 +1,223 @@
+import tkinter as tk
+from pprint import pp
+import sys
 import os
+from debugger import Debugger
 import pickle
-import queue
-import subprocess
-import webbrowser
-import dearpygui.dearpygui as dpg
 from flamegraph import *
+from folder_tree import FolderTree
 from pathlib import Path
-from urllib.parse import quote
-
-from vscode_bridge import VSCodeBridge
-
-
-def remove_item(tag):
-    if dpg.does_item_exist(tag):
-        dpg.delete_item(tag)
+#from color_flamegraph import Colorizer
+from view.flamegraph_view import *
+from view.dso_color_view import *
+from view.folder_color_view import *
+from view.sandwich_view import *
+from request_editor import *
 
 class Application:
-    def __init__(self, flamegraphs_file="flamegraphs.pickle"):
-        with open(flamegraphs_file, "rb") as f:
-            self.fgs = pickle.load(f)
+    def __init__(self, root, bottom_right, flamegraph_file, diff_flamegraph_file=None):
+        fg = load_flamegraph(flamegraph_file)
+        diff_fg = load_flamegraph(diff_flamegraph_file) if diff_flamegraph_file else None
 
-        self.active_node = None
-        self.hovered_node = None
-        self.current_comm = None
-        self.source_path = None
-        self.source_line = None
-        self.pending_commands = queue.Queue()
-        self.bridge = None
+        self.fgv = FlamegraphView(fg, diff_fg, list(fg.roots.keys())[int(sys.argv[2])], root)
+        self.ft = FolderTree(fg, self.fgv.current_node)
+        self.dbg = Debugger()
+        self.dcv = DsoColorView(self.fgv.fg, palette_name='kelley')
+        self.fcv = FolderColorView(self.ft, palette_name='tableau', right_cb=self.path_menu)
+        self.color_strategy = self.fcv
+        self.sv = SandwichView(self.fgv.fg, self.fgv.current_node, bottom_right, self.color_strategy)
 
-        from debugger import Debugger
-        self.dbg = Debugger(os.environ["SOURCE_EXE"])
+        def select_cb(node):
+            self.fgv.current_node = node
+            self.fcv.update_current_path(self.ft.get_pathfunc(node))
+            print(self.ft.get_pathfunc(node))
+            self.fgv.draw()
+            editor_jump_to_node(self.fgv.fg, node)
+        self.fgv.set_select_cb(select_cb)
+        self.fgv.set_color_cb(self.color_strategy.color)
+        self.fgv.set_magnify_cb(self.node_menu)
 
-        self._start_bridge()
 
-    def _start_bridge(self):
-        port = int(os.environ.get("VSCODE_BRIDGE_PORT", "8765"))
 
-        def on_command(payload):
-            self.pending_commands.put(payload)
+    def node_menu(self, node, event):
+        menu = tk.Menu(root, tearoff=0)
 
-        self.bridge = VSCodeBridge(port=port, on_command=on_command)
-        self.bridge.start()
-        print(f"VS Code bridge listening on http://127.0.0.1:{port}")
+        def rebase_color():
+            print("set as root")
+            self.fgv.magnified_node = node
+            self.refresh()
 
-    def _process_pending_commands(self):
-        while True:
-            try:
-                payload = self.pending_commands.get_nowait()
-            except queue.Empty:
-                return
+        def reset_color():
+            print("set as root")
+            self.fgv.magnified_node = self.fgv.root
+            self.refresh()
 
-            action = payload.get("action")
-            if action == "select_function":
-                name = payload.get("function")
-                if name:
-                    node = self._find_node_by_function_name(name)
-                    if node is not None:
-                        self.select_node(node)
-            elif action == "select_location":
-                path = payload.get("path")
-                line = payload.get("line")
-                if path and line is not None:
-                    node = self._find_node_by_pathline(path, int(line))
-                    if node is not None:
-                        self.select_node(node)
+        def rebase_sandwich():
+            print("set as sandwich node")
+            self.sv.set_sandwich_node(node.func_id)
+            self.refresh(keep_top_paths=True)
 
-    def _find_node_by_function_name(self, function_name):
-        if self.current_comm is None:
-            return None
-        root = self.fgs.roots.get(self.current_comm)
-        if root is None:
-            return None
+        menu.add_command(label="Set as color root", command=rebase_color)
+        menu.add_command(label="Set as sandwich node", command=rebase_sandwich)
+        menu.add_separator()
+        menu.add_command(label="Reset color", command=reset_color)
 
-        target = function_name.strip()
+        menu.tk_popup(event.x_root, event.y_root)
 
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            dso, name = self.fgs.idx_to_name.get(node.func_id, (None, None))
-            if name == target:
-                return node
-            stack.extend(node.children.values())
+    def path_menu(self, path, event):
+        menu = tk.Menu(root, tearoff=0)
 
-        return None
+        def reset_color():
+            print("set as root")
+            self.fgv.magnified_node = self.fgv.root
+            self.refresh()
 
-    def _find_node_by_pathline(self, path, line):
-        if self.current_comm is None:
-            return None
-        root = self.fgs.roots.get(self.current_comm)
-        if root is None:
-            return None
+        def color_path():
+            print("set as root")
+            self.fcv.top_paths = [path]
+            self.refresh(keep_top_paths=True)
 
-        normalized_path = str(Path(path).resolve())
-        best = None
-        best_dist = None
+        menu.add_command(label="Color path", command=color_path)
+        menu.add_separator()
+        menu.add_command(label="Reset color", command=reset_color)
 
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            pathline = self.fgs.id_to_path.get(node.func_id)
-            if pathline and ":" in pathline and not pathline.startswith("["):
-                node_path, _, node_line = pathline.rpartition(":")
-                try:
-                    node_path = str(Path(node_path).resolve())
-                    node_line = int(node_line)
-                except Exception:
-                    node_path = None
+        menu.tk_popup(event.x_root, event.y_root)
 
-                if node_path == normalized_path:
-                    dist = abs(node_line - int(line))
-                    if best_dist is None or dist < best_dist:
-                        best_dist = dist
-                        best = node
+    def refresh(self, keep_top_paths=False):
+        self.ft.rebuild(self.fgv.magnified_node)
+        if not keep_top_paths:
+            self.fcv.reset_top_paths()
+        self.color_strategy.draw_legend(top_right)
+        self.fgv.draw()
+        self.sv.draw()
 
-            stack.extend(node.children.values())
+    def draw_control_panel(self, parent):
+        # --- container ---
+        ctrl = tk.Frame(parent)
+        ctrl.pack(fill='x', side='top', padx=5, pady=5)
 
-        return best
+        roots = self.fgv.fg.roots
+        total_samples = sum(v.total() for v in roots.values()) or 1
+        comms = sorted(roots.keys(), key=lambda c: roots[c].total(), reverse=True)
+        comm_labels = [f"{c} ({roots[c].total() / total_samples * 100:.1f}%)" for c in comms]
+        self._comm_map = dict(zip(comm_labels, comms))
 
-    def _open_in_vscode(self, path, line):
-        if not path:
-            return
-        try:
-            line = int(line)
-        except Exception:
-            line = 1
+        # --- ROW 1: Comm Selection ---
+        row1 = tk.Frame(ctrl)
+        row1.pack(fill='x', side='top', pady=2)
 
-        abspath = str(Path(path).resolve())
-        cmd = ["code", "--goto", f"{abspath}:{line}"]
-        try:
-            subprocess.run(cmd, check=False)
-            return
-        except FileNotFoundError:
-            pass
+        tk.Label(row1, text="Select comm:").pack(side='left')
 
-        uri = f"vscode://file/{quote(abspath)}:{line}"
-        webbrowser.open(uri)
+        self._selected_comm = tk.StringVar()
+        if comm_labels:
+            self._selected_comm.set(comm_labels[0])
 
-    def select_node(self, node):
-        old_active = self.active_node
-        if node is not None:
-            self.active_node = node
-        if node != old_active:
-            self.draw_flamegraph(self.active_node)
-            self.set_source(self.active_node)
+        def update_comm(*_):
+            label = self._selected_comm.get()
+            comm = self._comm_map.get(label)
+            if not comm: return
+            node = roots[comm]
+            self.fgv.current_node = node
+            self.fgv.magnified_node = node
+            self.fgv.root = node
+            self.sv.set_root(node)
+            self.refresh()
 
-    def hover_node(self, node):
-        old_hover = self.hovered_node
-        if node is not None:
-            self.hovered_node = node
-        if node != old_hover:
-            self.set_source(self.hovered_node)
-
-    def set_source(self, node):
-        self.source_path = None
-        self.source_line = None
-
-        if node is None:
-            return
-
-        pathline = self.fgs.id_to_path.get(node.func_id)
-        print(pathline)
-        if pathline is None:
-            return
-
-        if pathline.startswith("["):
-            remove_item("source-container")
-            with dpg.child_window(width=-1, height=-1, border=False, tag="source-container", parent="source-window"):
-                dpg.add_text(pathline)
-            return
-
-        line_hist = self.dbg.byte_to_line_histogram(
-            node.counter,
-            self.fgs.idx_to_name[node.func_id][1]
+        dropdown = ttk.OptionMenu(
+            row1, # Attached to row1
+            self._selected_comm,
+            self._selected_comm.get(),
+            *comm_labels,
+            command=lambda _: update_comm()
         )
+        dropdown.pack(side='left', padx=5)
 
-        total_samples = sum(node.counter.values())
-        if total_samples == 0:
-            total_samples = 1  # avoid division by zero
+        # --- ROW 2: Coloring Mode ---
+        row2 = tk.Frame(ctrl)
+        row2.pack(fill='x', side='top', pady=2)
 
+        tk.Label(row2, text="Coloring:").pack(side='left')
 
-        from pprint import pp
-        pp(self.dbg.byte_to_line_histogram(node.counter, self.fgs.idx_to_name[node.func_id][1]))
+        self._color_mode = tk.StringVar()
+        self._color_mode.set("Folder")
 
-        path, _, line_no = pathline.rpartition(':')
-        self.source_path = path
-        self.source_line = int(line_no)
-        try:
-            with open(path, 'r') as f:
-                full_lines = f.readlines()
-                header = full_lines[int(line_no)-3:int(line_no)]
-                lines = full_lines[int(line_no):int(line_no) + 200]
-        except (OSError, ValueError):
-            remove_item("source-container")
-            with dpg.child_window(width=-1, height=-1, border=False, tag="source-container", parent="source-window"):
-                dpg.add_text(pathline)
-                dpg.add_button(
-                    label="Open in VS Code",
-                    callback=lambda s, a, u: u[0]._open_in_vscode(u[1], u[2]),
-                    user_data=(self, path, int(line_no)),
-                )
-            return
+        def update_color_mode(*_):
+            mode = self._color_mode.get()
+            old_color_strategy = self.color_strategy
+            self.color_strategy = self.dcv if mode == "DSO" else self.fcv
+            if old_color_strategy != self.color_strategy or mode == "DSO":
+                self.fcv.reset_drawing()
+            self.fgv.set_color_cb(self.color_strategy.color)
+            self.refresh(keep_top_paths=True)
 
-        display_lines = []
-        for i, line in enumerate(lines, start=1):  # lines start at 1
-            count = line_hist.get(i, 0)
-            percent = int(count * 100 / total_samples)
-            if percent > 0:
-                display_line = f"{percent:>3}% {line}"
-            else:
-                display_line = f"    {line}"  # align lines with no samples
-            display_lines.append(display_line)
+        color_dropdown = ttk.OptionMenu(
+            row2, # Attached to row2
+            self._color_mode,
+            self._color_mode.get(),
+            "Folder",
+            "DSO",
+            command=lambda _: update_color_mode()
+        )
+        color_dropdown.pack(side='left', padx=5)
 
-        remove_item("source-container")
-        with dpg.child_window(width=-1, height=-1, border=False, tag="source-container", parent="source-window"):
-            rel_path = path
-            try:
-                rel_path = str(Path(path).relative_to(base_dir))
-            except ValueError:
-                pass
-            dpg.add_text(f"{rel_path}:{line_no}")
-            dpg.add_button(
-                label="Open in VS Code",
-                callback=lambda s, a, u: u[0]._open_in_vscode(u[1], u[2]),
-                user_data=(self, path, int(line_no)),
-            )
-            dpg.add_separator()
-            dpg.add_text(''.join(header))
-            dpg.add_text(''.join(display_lines))
+        # initial update
+        update_comm()
 
 
-    def draw_flamegraph(self, root):
-        WIDTH = parent_width = dpg.get_item_width("flamegraph-window")
-        WINDOW_HEIGHT = parent_height = dpg.get_item_height("flamegraph-window")
-        RECT_HEIGHT=20
-        rects = []
+if __name__ == '__main__':
+    root = tk.Tk()
+    root.title("Flamegraph Profiler")
 
-        # --- find ancestors ---
-        ancestors = []
-        current = root.parent
-        while current is not None:
-            ancestors.append(current)
-            current = current.parent
-        ancestors.reverse()
+    # Create a horizontal paned window
+    paned = tk.PanedWindow(root, orient=tk.HORIZONTAL)
+    paned.pack(fill=tk.BOTH, expand=True)
 
-        start_depth = len(ancestors)
+    # Left frame (75%)
+    left_frame = tk.Frame(paned, bg="white")  # this is where your flamegraph goes
+    paned.add(left_frame, stretch="always")   # main area expands
 
-        layout(root, 0, WIDTH - 40, start_depth, rects)
-        ancestor_rects = [(node, 0, WIDTH - 40, i) for i, node in enumerate(ancestors)]
-        rects_to_render = ancestor_rects + rects
+    right_frame = tk.Frame(paned, bg="gray")
+    paned.add(right_frame)
 
-        # --- draw child window ---
-        remove_item("flamegraph-container")
+    # Right frame becomes another paned window
+    right_paned = tk.PanedWindow(right_frame, orient=tk.VERTICAL)
+    right_paned.pack(fill=tk.BOTH, expand=True)
 
-        with dpg.child_window(width=-1, height=-1, border=False, tag="flamegraph-container", parent="flamegraph-window"):
-            # invert y so depth 0 is at bottom
-            max_depth = max(depth for _, _, _, depth in rects_to_render) if rects_to_render else 0
-            # compute total used height
-            total_height = (max_depth + 1) * RECT_HEIGHT
-            y_offset = max(0, WINDOW_HEIGHT - total_height)  # push down if smaller than window
+    control_panel = tk.Frame(right_paned)
+    right_paned.add(control_panel)
 
-            for i, (node, x0, x1, depth) in enumerate(rects_to_render):
-                width = max(x1 - x0, 1)
-                y = (max_depth - depth) * RECT_HEIGHT + y_offset
+    right_data = tk.PanedWindow(right_paned, orient=tk.VERTICAL)
+    #right_data.pack(fill=tk.BOTH, expand=True)
+    right_paned.add(right_data, stretch="always")
 
-                label = self.fgs.func_label(node.func_id) if width > 60 else ""
-                if node.parent is None:
-                    label = "[all]"
+    # Top-right pane
+    top_right = tk.Frame(right_data, bg="lightgray")
+    right_data.add(top_right, stretch="always")
 
-                tag = f"func_button_{i}"
+    # Bottom-right pane
+    bottom_right = tk.Frame(right_data, bg="lightgray")
+    right_data.add(bottom_right)
 
-                # get path for coloring
-                path = self.fgs.id_to_path.get(node.func_id, "[unknown]")
-                rgb = pc.color(path)
-                color = [int(c*255) for c in rgb] + [255]
+    # Optional: set initial split (e.g. 50/50)
+    root.update_idletasks()
+    total_height = right_paned.winfo_height() or 600
+    right_paned.sash_place(0, 0, int(total_height * 0.5))
 
-                with dpg.theme() as color_theme:
-                    with dpg.theme_component(dpg.mvAll):
-                        dpg.add_theme_color(dpg.mvThemeCol_Button, tuple(color))
-                        dpg.add_theme_color(dpg.mvThemeCol_Text, (0,0,0,255))  # black text
+    total_height = right_paned.winfo_height()
+    split = int(total_height * 0.1)
+    right_paned.sash_place(0, 0, split)
 
-                remove_item(f"flamegraph_hover_handler_{i}")
-                def hover_callback(sender, app_data, user_data):
-                    self.hover_node(user_data)
-                with dpg.item_handler_registry(tag=f"flamegraph_hover_handler_{i}") as handler:
-                    dpg.add_item_hover_handler(callback=hover_callback, user_data=node)
+    # Set initial size ratio (~75%)
+    #root.update_idletasks()
+    total_width = root.winfo_width() or 800
+    paned.sash_place(0, int(total_width * 0.75), 0)
 
-                dpg.add_button(
-                    label=label,
-                    pos=(x0, y),
-                    width=width,
-                    height=RECT_HEIGHT,
-                    callback=lambda s,a,u: u[0].select_node(u[1]),
-                    user_data=(self, node),
-                    tag=tag
-                )
-                dpg.bind_item_handler_registry(tag, f"flamegraph_hover_handler_{i}")
-                dpg.bind_item_theme(tag, color_theme)
-                dpg.set_y_scroll("flamegraph-container", max_depth * RECT_HEIGHT)
+    app = Application(left_frame, bottom_right, sys.argv[1])
+    app.color_strategy.draw_legend(top_right)
+    app.fgv.draw()
+    #app.dcv.draw_legend(bottom_right)
+    #app.fcv.draw_tree(top_right)
+    app.sv.draw()
+    app.draw_control_panel(control_panel)
 
-        # auto-scroll to bottom
-        dpg.set_y_scroll("flamegraph-container", max_depth * RECT_HEIGHT)
-        #dpg.set_primary_window("flamegraph-window", True)
-
-    def run(self):
-        dpg.create_context()
-
-
-        with dpg.window(label="Flamegraph", tag="flamegraph-window", width=1400, height=1000):
-            totals = {k: self.fgs.roots[k].total() for k in self.fgs.roots}
-            grand_total = sum(totals.values()) or 1  # avoid div by zero
-
-            items = sorted(totals, key=totals.get, reverse=True)
-            labels = {
-                f"{k} ({totals[k] / grand_total:.1%})": k
-                for k in items
-            }
-
-            def on_select(sender, app_data):
-                key = labels[app_data]
-                 
-                self.current_comm = key
-                self.select_node(self.fgs.roots[key])
-
-            dpg.add_combo(list(labels.keys()), callback=on_select, default_value=next(iter(labels.keys())))
-            pc.draw_legend()
-            dpg.add_button(label="Refresh", callback=lambda s, a, u: u.select_node(None), user_data=self)
-            on_select(None, next(iter(labels.keys())))
-
-        with dpg.window(label="Function snippet", tag="source-window", height=800, width=400):
-            pass
-
-
-        dpg.create_viewport(title="Flamegraph", width=1500, height=900)
-        dpg.setup_dearpygui()
-        dpg.show_viewport()
-
-        while dpg.is_dearpygui_running():
-            self._process_pending_commands()
-            dpg.render_dearpygui_frame()
-
-        if self.bridge is not None:
-            self.bridge.stop()
-
-        dpg.destroy_context()
-
-groups = {
-    "net": ["net", "drivers/net"],
-    "memory": ["mm"],
-    "fs": ["fs"],
-    "core": ["kernel"],
-    "arch": ["arch"]
-}
-
-# Optional overrides: RGB tuples (0–1 range)
-overrides = {
-    "net": (1.0, 0.0, 0.0),      # force net group red
-    "misc": (0.8, 0.8, 0.8),     # misc white
-}
-
-# Optional: base directory to strip from paths
-base_dir = "/vol/os/linux"
-
-from color_flamegraph import PathColorizer
-# Initialize PathColorizer
-pc = PathColorizer(groups=groups, base_dir_root=base_dir, overrides=overrides)
-
-
-Application().run()
+    root.mainloop()
